@@ -4,6 +4,8 @@
 
 브라우저에서 http://127.0.0.1:8000 접속.
 
+https://drive.google.com/file/d/1ZQOWTOz-1pefqM7cg5XMZV2MYgxdRUju/view?usp=drive_link
+
 폴더구조
 focus_realtime/
  ├─ src/
