@@ -1,200 +1,204 @@
-# src/camera_worker.py
-
 import os
 import time
-import base64
-from collections import deque, Counter
-from datetime import datetime
+import threading
+from collections import deque
+from typing import Dict, Any, Optional
 
 import cv2
 import numpy as np
-import mediapipe as mp
 
-from .model_utils import EmotionPredictor
-from .pose_utils import HeadPoseEstimator
+from .model_utils import FocusPipeline, FocusResult
 
+PROJECT_ROOT = os.path.dirname(os.path.dirname(__file__))
+RUNS_DIR = os.path.join(PROJECT_ROOT, "runs")
+SCREEN_DIR = os.path.join(PROJECT_ROOT, "screenshots")
+os.makedirs(RUNS_DIR, exist_ok=True)
+os.makedirs(SCREEN_DIR, exist_ok=True)
 
-# =========================
-# 로그 매니저
-# =========================
-class LogManager:
-    def __init__(self, base_dir: str = "runs"):
-        os.makedirs(base_dir, exist_ok=True)
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.session_dir = os.path.join(base_dir, ts)
-        os.makedirs(self.session_dir, exist_ok=True)
+LOG_PATH = os.path.join(RUNS_DIR, f"focus_log_{int(time.time())}.csv")
 
-        self.csv_path = os.path.join(self.session_dir, "focus_log.csv")
-        with open(self.csv_path, "w", encoding="utf-8") as f:
-            f.write("time,focus,ear,yaw,pitch,roll,emotion\n")
+shared_state: Dict[str, Any] = dict(
+    lock=threading.Lock(),
+    time=deque(maxlen=5000),
+    focus=deque(maxlen=5000),
+    emotion=deque(maxlen=5000),
+    blink=deque(maxlen=5000),
+    latest={},
+    frames=0,
+    saved=0,
+    fps=0.0,
+    start_ts=time.strftime("%Y-%m-%d %H:%M:%S"),
+)
 
-    def write_row(self, t, focus, ear, yaw, pitch, roll, emo):
-        with open(self.csv_path, "a", encoding="utf-8") as f:
-            f.write(
-                f"{t:.2f},{focus:.4f},{ear:.4f},{yaw:.2f},{pitch:.2f},{roll:.2f},{emo}\n"
-            )
+_pipeline = FocusPipeline()
 
-    def get_csv_path(self):
-        return self.csv_path
+_last_frame_bgr: Optional[np.ndarray] = None
+_last_result: Optional[FocusResult] = None
 
+_last_save_ts = 0.0
+_focus_threshold = 0.4
+_save_cooldown = 5.0
 
-log_manager = LogManager()
+_frame_count = 0
+_last_fps_ts = time.time()
 
-
-# =========================
-# 웹 공유 상태
-# =========================
-shared_state = {
-    "frame_b64": None,
-    "focus": 0.0,
-    "avg_10s": 0.0,
-    "avg_1m": 0.0,
-    "avg_10m": 0.0,
-    "emotion_rank": [],
-    "latest": {},
-    "user": "",
-}
-
-# =========================
-# EAR 기준 (초기 버전으로 복구)
-# =========================
-EAR_CLOSE = 0.18   # 눈 감김
-EAR_OPEN = 0.30    # 눈 완전 뜬 상태
+_user_name = "anonymous"
+_user_slug = "anonymous"
 
 
-class BlinkEstimator:
-    def __init__(self):
-        self.face_mesh = mp.solutions.face_mesh.FaceMesh(max_num_faces=1)
-        self.left_idx = [33, 160, 158, 133, 153, 144]
-        self.right_idx = [263, 387, 385, 362, 380, 373]
-
-    def _ear(self, e):
-        A = np.linalg.norm(e[1] - e[5])
-        B = np.linalg.norm(e[2] - e[4])
-        C = np.linalg.norm(e[0] - e[3]) + 1e-6
-        return (A + B) / (2.0 * C)
-
-    def score(self, frame_bgr):
-        h, w = frame_bgr.shape[:2]
-        res = self.face_mesh.process(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
-        if not res.multi_face_landmarks:
-            # 얼굴 못 찾으면 중립값
-            return 0.7, 0.0
-
-        lm = res.multi_face_landmarks[0].landmark
-        xy = lambda i: np.array([lm[i].x * w, lm[i].y * h], dtype=np.float32)
-
-        L = np.array([xy(i) for i in self.left_idx])
-        R = np.array([xy(i) for i in self.right_idx])
-
-        ear = (self._ear(L) + self._ear(R)) / 2.0
-        s = (ear - EAR_CLOSE) / (EAR_OPEN - EAR_CLOSE + 1e-6)
-        score = float(np.clip(s, 0.0, 1.0))
-        return score, float(ear)
+def slugify_korean(text: str) -> str:
+    """한국어 → 로마자 비슷한 ASCII 변환 (단순 치환)"""
+    import re
+    mapping = {
+        "가":"ga","나":"na","다":"da","라":"ra","마":"ma","바":"ba","사":"sa",
+        "아":"a","자":"ja","차":"cha","카":"ka","타":"ta","파":"pa","하":"ha",
+        "강":"kang","김":"kim","박":"park","정":"jung","이":"lee","최":"choi",
+        "홍":"hong","길":"gil","동":"dong"
+    }
+    out = ""
+    for ch in text:
+        if ch in mapping:
+            out += mapping[ch]
+        elif ch.isalnum():
+            out += ch.lower()
+        # 그 외 문자는 제거
+    return re.sub(r"[^a-z0-9]+", "", out.lower()) or "user"
 
 
-# =========================
-# 집중도 가중합 (조금 더 높게 나오도록 조정)
-# =========================
-def concentration_score(
-    gaze, neck, emotion, blink,
-    w_gaze=0.35, w_neck=0.30, w_emotion=0.25, w_blink=0.10
-):
-    vals = [gaze or 0.0, neck or 0.0, emotion or 0.0, blink or 0.0]
-    ws = [w_gaze, w_neck, w_emotion, w_blink]
-    s = sum(a * b for a, b in zip(vals, ws))
-    return float(np.clip(s, 0.0, 1.0))
+def set_user_name(name: Optional[str]):
+    global _user_name, _user_slug
+    if not name:
+        _user_name = "anonymous"
+        _user_slug = "anonymous"
+    else:
+        _user_name = name
+        _user_slug = slugify_korean(name)
 
 
-# =========================
-# 메인 카메라 루프 (스레드에서 실행)
-# =========================
-def start_camera_loop():
-    print("📸 start_camera_loop 시작")
-
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        print("❌ 카메라 열기 실패")
-        return
-
-    blink = BlinkEstimator()
-    pose = HeadPoseEstimator()
-    emo = EmotionPredictor()  # models/best_model.pth + meta.csv 사용
-
-    focus_hist = deque(maxlen=60 * 10 * 30)  # 최대 10분치 근사
-    emotion_counter = Counter()
-    t0 = time.time()
-
-    os.makedirs("screenshots", exist_ok=True)
-
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            time.sleep(0.03)
-            continue
-
-        t = time.time() - t0
-
-        # --- 개별 지표 ---
-        blink_score, ear = blink.score(frame)
-        neck_score, (yaw, pitch, roll) = pose.score(frame)
-        emo_score, probs, emo_top = emo.predict(frame)
-        gaze_score = 1.0  # 아직 시선추적 없음 → 항상 정면 본다고 가정
-
-        # --- 최종 집중도 ---
-        final_focus = concentration_score(
-            gaze_score, neck_score, emo_score, blink_score
+def _save_log(elapsed: float, res: FocusResult):
+    with open(LOG_PATH, "a", encoding="utf-8") as f:
+        f.write(
+            f"{_user_name},{elapsed:.2f},{res.focus:.4f},{res.emotion_score:.4f},"
+            f"{res.blink_score:.4f},{res.ear or 0:.4f},{res.blink_rate or 0:.2f},{res.top_emotion}\n"
         )
-        focus_hist.append(final_focus)
 
-        # --- 평균값 (샘플 개수 기반 근사) ---
-        arr = list(focus_hist)
-        avg_10s = float(np.mean(arr[-300:])) if len(arr) >= 30 else final_focus
-        avg_1m = float(np.mean(arr[-1800:])) if len(arr) >= 180 else final_focus
-        avg_10m = float(np.mean(arr)) if len(arr) >= 600 else final_focus
 
-        # --- 감정 빈도 카운트 ---
-        emotion_counter[emo_top] += 1
-        rank = emotion_counter.most_common(5)  # [(label, count), ...]
+def _render_overlay(frame: np.ndarray, res: FocusResult):
+    """저장용 이미지에 텍스트 표시 (영문 ASCII username 사용)"""
+    # 크게 보기 좋게 1280x960으로 업스케일
+    overlay = cv2.resize(frame, (1280, 960), interpolation=cv2.INTER_CUBIC)
 
-        # --- 30% 미만 → 스크린샷 저장 (텍스트 오버레이 포함) ---
-        if final_focus < 0.3:
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            img = frame.copy()
-            cv2.putText(
-                img, f"Focus: {final_focus*100:.1f}%",
-                (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2
-            )
-            cv2.putText(
-                img, ts, (10, 65),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2
-            )
-            out_path = os.path.join("screenshots", f"focus_drop_{ts}.jpg")
-            cv2.imwrite(out_path, img)
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    y = 40
 
-        # --- CSV 로그 기록 ---
-        log_manager.write_row(t, final_focus, ear, yaw, pitch, roll, emo_top)
+    cv2.putText(overlay, f"User: {_user_slug}", (20, y), font, 1.0, (255,255,255), 2)
+    y += 40
+    cv2.putText(overlay, f"Focus: {res.focus*100:.1f}%", (20, y), font, 1.0, (0,255,255), 2)
+    y += 40
+    cv2.putText(overlay, f"EmotionScore: {res.emotion_score*100:.1f}% (w=0.7)", (20,y), font, 0.9, (0,255,0), 2)
+    y += 35
+    cv2.putText(overlay, f"BlinkScore: {res.blink_score*100:.1f}% (w=0.3)", (20,y), font, 0.9, (0,200,255), 2)
+    y += 35
+    if res.top_emotion:
+        cv2.putText(overlay, f"TopEmotion: {res.top_emotion}", (20,y), font, 0.9, (255,200,0), 2)
 
-        # --- 프레임 → base64 인코딩 ---
-        ok, buf = cv2.imencode(".jpg", frame)
-        if not ok:
-            continue
-        frame_b64 = base64.b64encode(buf).decode("ascii")
+    return overlay
 
-        # --- shared_state 업데이트 ---
-        shared_state["frame_b64"] = frame_b64
-        shared_state["focus"] = final_focus
-        shared_state["avg_10s"] = avg_10s
-        shared_state["avg_1m"] = avg_1m
-        shared_state["avg_10m"] = avg_10m
-        shared_state["emotion_rank"] = [[k, v] for k, v in rank]
-        shared_state["latest"] = {
-            "ear": ear,
-            "yaw": yaw,
-            "pitch": pitch,
-            "roll": roll,
-            "emotion": emo_top,
-        }
 
-        time.sleep(0.03)  # ~30fps 정도
+def _save_image(frame_bgr: np.ndarray, res: FocusResult, force=False):
+    global _last_save_ts
+
+    now = time.time()
+    if not force:
+        if res.focus >= _focus_threshold:
+            return False
+        if now - _last_save_ts < _save_cooldown:
+            return False
+
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    pct = int(res.focus * 100)
+
+    filename = f"{_user_slug}_focus{pct}_{ts}.jpg"  # ASCII-only
+    path = os.path.join(SCREEN_DIR, filename)
+
+    overlay = _render_overlay(frame_bgr, res)
+    cv2.imwrite(path, overlay)
+
+    with shared_state["lock"]:
+        shared_state["saved"] += 1
+
+    _last_save_ts = now
+    print(f"[Saved] {path}")
+    return True
+
+
+def process_frame(frame_bgr: np.ndarray, user: Optional[str] = None):
+    global _last_frame_bgr, _last_result
+    global _frame_count, _last_fps_ts
+
+    if user:
+        set_user_name(user)
+
+    t_abs = time.time()
+    elapsed = t_abs - _pipeline.start_ts
+
+    res: FocusResult = _pipeline.process(frame_bgr)
+    _last_frame_bgr = frame_bgr.copy()
+    _last_result = res
+
+    _save_log(elapsed, res)
+    _save_image(frame_bgr, res, force=False)
+
+    _frame_count += 1
+    dt = t_abs - _last_fps_ts
+    if dt >= 1.0:
+        shared_state["fps"] = _frame_count / dt
+        _frame_count = 0
+        _last_fps_ts = t_abs
+
+    with shared_state["lock"]:
+        shared_state["time"].append(elapsed)
+        shared_state["focus"].append(res.focus)
+        shared_state["emotion"].append(res.emotion_score)
+        shared_state["blink"].append(res.blink_score)
+        shared_state["frames"] += 1
+        shared_state["latest"] = dict(
+            user=_user_name,
+            focus=res.focus,
+            emotion_score=res.emotion_score,
+            blink_score=res.blink_score,
+            ear=res.ear,
+            blink_rate=res.blink_rate,
+            top_emotion=res.top_emotion,
+        )
+
+
+def save_snapshot(user=None):
+    if user:
+        set_user_name(user)
+
+    if _last_frame_bgr is None or _last_result is None:
+        return False
+
+    return _save_image(_last_frame_bgr, _last_result, force=True)
+
+
+def get_live_state():
+    with shared_state["lock"]:
+        return dict(
+            time=list(shared_state["time"]),
+            focus=list(shared_state["focus"]),
+            emotion=list(shared_state["emotion"]),
+            blink=list(shared_state["blink"]),
+            latest=shared_state["latest"],
+            fps=shared_state["fps"],
+        )
+
+
+def get_session_meta():
+    with shared_state["lock"]:
+        return dict(
+            start_ts=shared_state["start_ts"],
+            frames=shared_state["frames"],
+            saved=shared_state["saved"],
+        )
