@@ -1,0 +1,11 @@
+opencv-python
+mediapipe
+numpy
+torch
+torchvision
+timm
+pandas
+matplotlib
+fastapi
+uvicorn[standard]
+Pillow
