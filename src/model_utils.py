@@ -62,7 +62,7 @@ class EmotionModel:
 
         # 가중치 로드
         if os.path.exists(MODEL_PATH):
-            sd = torch.load(MODEL_PATH, map_location=self.device)
+            sd = torch.load(MODEL_PATH, map_location=self.device, weights_only=False)
             if isinstance(sd, dict):
                 if "model" in sd:
                     sd = sd["model"]
