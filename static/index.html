@@ -87,7 +87,7 @@
     let captureTimer = null;
     let pollTimer = null;
     const focusHist = [];
-    const emotionCount = {};  // 감정 빈도수 집계
+    const emotionCount = {};
 
     async function startCameraIfNeeded() {
       if (stream) return;
@@ -122,9 +122,9 @@
 
       const canvas = document.createElement("canvas");
       const ctx = canvas.getContext("2d");
-      canvas.width = 320;
-      canvas.height = 240;
-      ctx.drawImage(video, 0, 0, 320, 240);
+      canvas.width = 640;
+      canvas.height = 480;
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
       const blob = await new Promise(res => canvas.toBlob(res, "image/jpeg", 0.7));
       const fd = new FormData();
       fd.append("frame", blob, "frame.jpg");
@@ -163,14 +163,12 @@
         document.getElementById("frames").innerText = sess.frames || 0;
         document.getElementById("saved").innerText = sess.saved || 0;
 
-        // latest 정보 표시 (모든 수치 %화)
         const latestCopy = { ...latest };
         if (latestCopy.focus != null) latestCopy.focus = (latestCopy.focus*100).toFixed(1) + "%";
         if (latestCopy.emotion_score != null) latestCopy.emotion_score = (latestCopy.emotion_score*100).toFixed(1) + "%";
         if (latestCopy.blink_score != null) latestCopy.blink_score = (latestCopy.blink_score*100).toFixed(1) + "%";
         document.getElementById("latest").innerText = JSON.stringify(latestCopy, null, 2);
 
-        // 감정 빈도수 집계
         const topEmotion = latest.top_emotion;
         if (topEmotion) {
           emotionCount[topEmotion] = (emotionCount[topEmotion] || 0) + 1;
@@ -202,9 +200,9 @@
     }
 
     function onStop() {
-    stopCameraCapture();
-    userName = "";   // ← 전송 완전 중단 핵심!!
-}
+      stopCameraCapture();
+      userName = "";
+    }
 
     async function onSnapshot() {
       if (!userName) {
@@ -228,7 +226,6 @@
       }
     }
 
-    // 페이지 로드시 폴링만 준비 (실제 스트리밍은 onStart에서 시작)
     window.addEventListener("load", () => {
       pollTimer = setInterval(poll, 700);
     });
