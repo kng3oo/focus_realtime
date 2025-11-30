@@ -1,7 +1,7 @@
 # src/model_utils.py
 import os
 from dataclasses import dataclass
-from typing import Optional, Dict
+from typing import Optional, Dict, Tuple
 
 import cv2
 import numpy as np
@@ -71,7 +71,13 @@ class EmotionModel:
 
         self.negative = {"anger", "disgust", "fear", "sad"}
 
-    def score(self, frame_bgr: np.ndarray) -> tuple[float, Dict[str, float], str]:
+    def score(self, frame_bgr: np.ndarray) -> Tuple[float, Dict[str, float], str]:
+        """
+        반환:
+          - float : 감정 기반 집중 점수 (0~1)
+          - Dict[str, float] : 감정별 확률
+          - str : 최상위 감정 라벨
+        """
         # BGR -> RGB
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         x = self.tf(rgb).unsqueeze(0).to(self.device)
@@ -111,7 +117,13 @@ class BlinkModel:
         C = np.linalg.norm(e[0] - e[3]) + 1e-6
         return (A + B) / (2.0 * C)
 
-    def score(self, frame_bgr: np.ndarray) -> tuple[float, float, float]:
+    def score(self, frame_bgr: np.ndarray) -> Tuple[float, float, float]:
+        """
+        반환:
+          - float : blink 기반 프레임 점수 (0~1)
+          - float : EAR 값
+          - float : blink_rate (지금은 누적 blink 수 정도)
+        """
         h, w = frame_bgr.shape[:2]
         res = self.face_mesh.process(
             cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
@@ -132,7 +144,7 @@ class BlinkModel:
         earR = self._ear(ptsR)
         ear = (earL + earR) / 2.0
 
-        # EAR → 점수 (open > close)
+        # EAR → 점수 (open에 가까울수록 1)
         s = (ear - self.ear_close) / (
             self.ear_open - self.ear_close + 1e-6
         )
