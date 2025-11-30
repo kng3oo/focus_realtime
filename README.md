@@ -1,11 +1,3 @@
-가상환경 활성화 및 패키지 설치: pip install -r requirements.txt (아래에 requirements 파일도 포함).
-
-서버 실행: uvicorn src.main:app --host 127.0.0.1 --port 8000 --reload
-
-브라우저에서 http://127.0.0.1:8000 접속.
-
-https://drive.google.com/file/d/1FaliWpxiz1KaUvE1WHZzAmoa8giCQflD/view?usp=drive_link
-
 폴더구조
 focus_realtime/
  ├─ src/
@@ -13,7 +5,9 @@ focus_realtime/
  │   ├─ model_utils.py
  │   ├─ pose_utils.py
  │   ├─ web_server.py
- │   └─ ...
+ │   ├─ log_utils.py
+ │   ├─ __init__.py
+ │   └─ main.py
  ├─ models/
  │   └─ best_model.pth
  ├─ static/
@@ -24,3 +18,16 @@ focus_realtime/
  ├─ README.md
  ├─ requirements.txt
  └─ venv/"# focus_realtime" 
+
+cd ~/focus_realtime
+source venv/bin/activate
+uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload
+
+sudo yum install -y mesa-libGL
+
+S3 폴더 비우기
+ACM인증서
+Route53
+
+---
+가비아 네임서버
